@@ -1,4 +1,4 @@
-"""
+﻿"""
 Snapchat Memories Downloader - Modern GUI
 A sleek, dark-themed interface for downloading Snapchat memories
 """
@@ -111,14 +111,14 @@ async def download_memory(
     output_dir: Path,
     add_exif: bool,
     semaphore: asyncio.Semaphore,
-) -> tuple[bool, int, str]:
+) -> tuple[bool, int, str, int | None]:
     async with semaphore:
         try:
             cdn_url = await get_cdn_url(memory.download_link)
             ext = Path(cdn_url.split("?")[0]).suffix or ".jpg"
             filename = f"{memory.filename}{ext}"
             output_path = output_dir / filename
-
+            
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                 response = await client.get(cdn_url)
                 response.raise_for_status()
@@ -129,9 +129,12 @@ async def download_memory(
                 if add_exif and ext == ".jpg":
                     add_exif_data(output_path, memory)
 
-                return True, len(response.content), filename
+                return True, len(response.content), filename, response.status_code
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code if e.response else None
+            return False, 0, str(e), status_code
         except Exception as e:
-            return False, 0, str(e)
+            return False, 0, str(e), None
 
 
 # ============== Theme & Styling ==============
@@ -350,17 +353,19 @@ class SnapchatDownloaderApp(ctk.CTk):
         
         # Window setup
         self.title("Snapchat Memories Downloader")
-        width, height = 900, 1100
+        width, height = 1100, 900
         screen_width = self.winfo_screenwidth()
         x = max((screen_width - width) // 2, 0)
         self.geometry(f"{width}x{height}+{x}+0")  # snap to top of the screen
         self.configure(fg_color=COLORS["bg_dark"])
         self.resizable(True, True)
-        self._apply_window_scaling(100)
         
         # State
         self.is_downloading = False
         self.memories: list[Memory] = []
+        self.year_vars: dict[int, ctk.BooleanVar] = {}
+        self.selected_years_cache: set[int] | None = None
+        self.auto_concurrency_var = ctk.BooleanVar(value=True)
         
         # Build UI
         self._create_widgets()
@@ -369,24 +374,38 @@ class SnapchatDownloaderApp(ctk.CTk):
         # Main container with padding
         container = ctk.CTkFrame(self, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=30, pady=30)
+        container.grid_columnconfigure(0, weight=3)
+        container.grid_columnconfigure(1, weight=2)
+        container.grid_rowconfigure(0, weight=1)
         
-        # Header
-        self._create_header(container)
+        # Left content column (scrollable content + pinned buttons)
+        left = ctk.CTkFrame(container, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_rowconfigure(1, minsize=120)
+        left.grid_columnconfigure(0, weight=1)
+        left_scroll = ctk.CTkScrollableFrame(left, fg_color="transparent")
+        left_scroll.grid(row=0, column=0, sticky="nsew")
+        left_footer = ctk.CTkFrame(left, fg_color="transparent")
+        left_footer.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         
-        # File selectors
-        self._create_file_section(container)
+        # Right console column
+        right = ctk.CTkFrame(container, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_columnconfigure(0, weight=1)
         
-        # Options
-        self._create_options_section(container)
+        # Build left column sections
+        self._create_header(left_scroll)
+        self._create_file_section(left_scroll)
+        self._create_options_section(left_scroll)
+        self._create_year_filter_section(left_scroll)
+        self._create_progress_section(left_scroll)
+        self._create_stats_section(left_scroll)
+        self._create_action_buttons(left_footer)
         
-        # Progress
-        self._create_progress_section(container)
-        
-        # Stats
-        self._create_stats_section(container)
-        
-        # Action buttons
-        self._create_action_buttons(container)
+        # Build console on the right
+        self._create_console_panel(right)
     
     def _create_header(self, parent):
         header_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -491,6 +510,20 @@ class SnapchatDownloaderApp(ctk.CTk):
         )
         self.skip_check.grid(row=0, column=1, sticky="w", pady=5)
         
+        # Auto concurrency checkbox
+        self.auto_concurrency_check = ctk.CTkCheckBox(
+            options_grid,
+            text="Auto-tune concurrency",
+            variable=self.auto_concurrency_var,
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+            text_color=COLORS["text_secondary"],
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            checkmark_color="#000000",
+            border_color=COLORS["border"]
+        )
+        self.auto_concurrency_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        
         # Concurrent downloads slider
         slider_frame = ctk.CTkFrame(options_inner, fg_color="transparent")
         slider_frame.pack(fill="x", pady=(15, 0))
@@ -526,8 +559,126 @@ class SnapchatDownloaderApp(ctk.CTk):
         self.concurrent_slider.pack(side="right", padx=(15, 10), fill="x", expand=True)
         self.concurrent_slider.set(40)
     
+    def _create_year_filter_section(self, parent):
+        section = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=16)
+        section.pack(fill="x", pady=(0, 20))
+        
+        inner = ctk.CTkFrame(section, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        header = ctk.CTkLabel(
+            inner,
+            text="📆  Years to download",
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            text_color=COLORS["text_primary"],
+            anchor="w"
+        )
+        header.pack(fill="x")
+        
+        subtitle = ctk.CTkLabel(
+            inner,
+            text="Load years from your JSON, then pick the ones you want.",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLORS["text_secondary"],
+            anchor="w"
+        )
+        subtitle.pack(fill="x", pady=(4, 10))
+        
+        controls = ctk.CTkFrame(inner, fg_color="transparent")
+        controls.pack(fill="x", pady=(0, 10))
+        
+        load_btn = ModernButton(
+            controls,
+            text="Refresh years from JSON",
+            command=self._load_years_from_json,
+            variant="secondary"
+        )
+        load_btn.pack(side="left", padx=(0, 10))
+        
+        self.select_all_years_btn = ModernButton(
+            controls,
+            text="Select all",
+            command=self._select_all_years,
+            variant="secondary"
+        )
+        self.select_all_years_btn.pack(side="left")
+        
+        self.year_list = ctk.CTkScrollableFrame(
+            inner,
+            fg_color=COLORS["bg_dark"],
+            corner_radius=12,
+            height=140
+        )
+        self.year_list.pack(fill="both", expand=True)
+        
+        placeholder = ctk.CTkLabel(
+            self.year_list,
+            text="Load your JSON to see available years",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLORS["text_secondary"]
+        )
+        placeholder.pack(pady=10)
+    
     def _on_slider_change(self, value):
         self.concurrent_value.configure(text=str(int(value)))
+    
+    def _clear_year_list(self):
+        for child in self.year_list.winfo_children():
+            child.destroy()
+    
+    def _populate_years(self, years: list[int], select_all: bool = True):
+        self._clear_year_list()
+        self.year_vars.clear()
+        if not years:
+            ctk.CTkLabel(
+                self.year_list,
+                text="No years found in JSON",
+                font=ctk.CTkFont(family="Segoe UI", size=12),
+                text_color=COLORS["text_secondary"]
+            ).pack(pady=10)
+            return
+        
+        for year in years:
+            var = ctk.BooleanVar(value=select_all)
+            chk = ctk.CTkCheckBox(
+                self.year_list,
+                text=str(year),
+                variable=var,
+                font=ctk.CTkFont(family="Segoe UI", size=13),
+                text_color=COLORS["text_primary"],
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_hover"],
+                checkmark_color="#000000",
+                border_color=COLORS["border"]
+            )
+            chk.pack(anchor="w", pady=2, padx=6)
+            self.year_vars[year] = var
+    
+    def _select_all_years(self):
+        for var in self.year_vars.values():
+            var.set(True)
+    
+    def _get_selected_years(self) -> set[int] | None:
+        if not self.year_vars:
+            return None
+        chosen = {year for year, var in self.year_vars.items() if var.get()}
+        return chosen or None
+    
+    def _load_years_from_json(self):
+        json_path = self.json_selector.get()
+        if not json_path or not Path(json_path).exists():
+            messagebox.showerror("Error", "Please select a valid JSON file first.")
+            return
+        
+        try:
+            memories = load_memories(Path(json_path))
+            years = sorted({m.date.year for m in memories})
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read years from JSON:\n{e}")
+            return
+        
+        self._populate_years(years, select_all=True)
+        self._log(f"Loaded years from JSON: {', '.join(map(str, years))}")
     
     def _create_progress_section(self, parent):
         self.progress_section = ProgressSection(parent)
@@ -571,6 +722,84 @@ class SnapchatDownloaderApp(ctk.CTk):
         self.cancel_btn.pack(fill="x")
         self.cancel_btn.configure(state="disabled")
     
+    def _create_console_panel(self, parent):
+        panel = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=16)
+        panel.grid(row=0, column=0, sticky="nsew")
+        panel.grid_rowconfigure(3, weight=1)
+        panel.grid_columnconfigure(0, weight=1)
+        
+        header = ctk.CTkLabel(
+            panel,
+            text="Live console",
+            font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+            text_color=COLORS["text_primary"]
+        )
+        header.grid(row=0, column=0, sticky="w", padx=16, pady=(16, 4))
+        
+        subheader = ctk.CTkLabel(
+            panel,
+            text="See progress, auto-tuned concurrency, and any warnings.",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLORS["text_secondary"]
+        )
+        subheader.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+        
+        progress_wrap = ctk.CTkFrame(panel, fg_color="transparent")
+        progress_wrap.grid(row=2, column=0, sticky="ew", padx=16)
+        progress_wrap.grid_columnconfigure(0, weight=1)
+        
+        self.console_file_label = ctk.CTkLabel(
+            progress_wrap,
+            text="Waiting to start...",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLORS["text_secondary"],
+            anchor="w"
+        )
+        self.console_file_label.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        
+        self.console_progress = ctk.CTkProgressBar(
+            progress_wrap,
+            height=10,
+            corner_radius=6,
+            fg_color=COLORS["bg_dark"],
+            progress_color=COLORS["accent"]
+        )
+        self.console_progress.grid(row=1, column=0, sticky="ew")
+        self.console_progress.set(0)
+        
+        self.console_text = ctk.CTkTextbox(
+            panel,
+            fg_color=COLORS["bg_dark"],
+            text_color=COLORS["text_primary"],
+            corner_radius=12,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            wrap="word"
+        )
+        self.console_text.grid(row=3, column=0, sticky="nsew", padx=16, pady=(12, 16))
+        self.console_text.insert("end", "Console ready.\n")
+        self.console_text.configure(state="disabled")
+    
+    def _append_log(self, message: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.console_text.configure(state="normal")
+        self.console_text.insert("end", f"[{timestamp}] {message}\n")
+        self.console_text.see("end")
+        self.console_text.configure(state="disabled")
+    
+    def _log(self, message: str):
+        self.after(0, lambda: self._append_log(message))
+    
+    def _update_console_progress(self, progress: float, current_file: str):
+        self.console_progress.set(progress)
+        if current_file:
+            self.console_file_label.configure(text=current_file)
+        else:
+            self.console_file_label.configure(text="")
+    
+    def _update_progress_ui(self, progress: float, current_file: str):
+        self.after(0, lambda p=progress, f=current_file: self.progress_section.update_progress(p, f))
+        self.after(0, lambda p=progress, f=current_file: self._update_console_progress(p, f"⬇️ {current_file}" if current_file else ""))
+    
     def _validate_inputs(self) -> bool:
         json_path = self.json_selector.get()
         output_path = self.output_selector.get()
@@ -593,12 +822,16 @@ class SnapchatDownloaderApp(ctk.CTk):
         if not self._validate_inputs():
             return
         
+        self.selected_years_cache = self._get_selected_years()
         self.is_downloading = True
         self.download_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
+        self._log("Starting download...")
         
         # Reset stats
         self.progress_section.reset()
+        self.console_progress.set(0)
+        self.console_file_label.configure(text="Preparing downloads...")
         self.stats_total.set_value("0")
         self.stats_downloaded.set_value("0")
         self.stats_skipped.set_value("0")
@@ -618,6 +851,8 @@ class SnapchatDownloaderApp(ctk.CTk):
         max_concurrent = int(self.concurrent_slider.get())
         add_exif = self.exif_var.get()
         skip_existing = self.skip_var.get()
+        auto_tune = self.auto_concurrency_var.get()
+        selected_years = self.selected_years_cache
         
         try:
             memories = load_memories(json_path)
@@ -626,8 +861,28 @@ class SnapchatDownloaderApp(ctk.CTk):
             self.after(0, self._download_complete)
             return
         
+        years_available = sorted({m.date.year for m in memories})
+        if not self.year_vars:
+            self.after(0, lambda yrs=years_available: self._populate_years(yrs, select_all=True))
+        elif set(self.year_vars.keys()) != set(years_available):
+            previous_selection = {y for y, var in self.year_vars.items() if var.get()}
+            def update_years():
+                self._populate_years(years_available, select_all=False)
+                for y in years_available:
+                    if y in previous_selection:
+                        self.year_vars[y].set(True)
+            self.after(0, update_years)
+        
+        if selected_years:
+            memories = [m for m in memories if m.date.year in selected_years]
+            self._log(f"Filtering to years: {', '.join(map(str, sorted(selected_years)))}")
+        
+        if not memories:
+            self.after(0, lambda: messagebox.showinfo("Info", "No snaps match the selected years."))
+            self.after(0, self._download_complete)
+            return
+        
         output_dir.mkdir(parents=True, exist_ok=True)
-        semaphore = asyncio.Semaphore(max_concurrent)
         
         stats = DownloadStats(total=len(memories))
         
@@ -644,6 +899,7 @@ class SnapchatDownloaderApp(ctk.CTk):
         # Update stats
         self.after(0, lambda: self.stats_total.set_value(str(stats.total)))
         self.after(0, lambda: self.stats_skipped.set_value(str(stats.skipped)))
+        self._log(f"Queued {len(to_download)} files ({stats.skipped} skipped).")
         
         if not to_download:
             self.after(0, lambda: messagebox.showinfo("Info", "All files are already downloaded!"))
@@ -652,13 +908,15 @@ class SnapchatDownloaderApp(ctk.CTk):
         
         completed = 0
         total_to_download = len(to_download)
+        current_concurrency = max(1, min(max_concurrent, total_to_download))
+        min_concurrency = 1
         
-        async def process_memory(memory: Memory):
+        async def process_memory(memory: Memory, semaphore: asyncio.Semaphore):
             nonlocal completed
             if not self.is_downloading:
-                return
+                return False, None
             
-            success, bytes_downloaded, result = await download_memory(
+            success, bytes_downloaded, result, status_code = await download_memory(
                 memory, output_dir, add_exif, semaphore
             )
             
@@ -671,18 +929,55 @@ class SnapchatDownloaderApp(ctk.CTk):
             else:
                 stats.failed += 1
                 current_file = f"Error: {result[:30]}..."
+                if status_code == 429:
+                    self._log("Rate limit detected on a request.")
             
             # Update UI
             progress = completed / total_to_download
-            self.after(0, lambda p=progress, f=current_file: self.progress_section.update_progress(p, f))
+            self._update_progress_ui(progress, current_file)
             self.after(0, lambda: self.stats_downloaded.set_value(str(stats.downloaded)))
             self.after(0, lambda: self.stats_failed.set_value(str(stats.failed)))
+            
+            return success, status_code
         
-        # Process all memories
-        await asyncio.gather(*[process_memory(m) for m in to_download])
+        idx = 0
+        while idx < total_to_download and self.is_downloading:
+            current_concurrency = max(min(current_concurrency, total_to_download - idx), 1)
+            batch = to_download[idx: idx + current_concurrency]
+            semaphore = asyncio.Semaphore(current_concurrency)
+            
+            self._log(f"Downloading batch {idx + 1}-{idx + len(batch)} / {total_to_download} at concurrency {current_concurrency}.")
+            start_time = time.perf_counter()
+            results = await asyncio.gather(*[process_memory(m, semaphore) for m in batch])
+            elapsed = time.perf_counter() - start_time
+            
+            failures = sum(1 for r in results if r and not r[0])
+            rate_limit_hits = any((r and r[1] == 429) for r in results)
+            avg_time = elapsed / max(len(batch), 1)
+            
+            if auto_tune:
+                new_concurrency = current_concurrency
+                if rate_limit_hits:
+                    new_concurrency = max(min_concurrency, current_concurrency // 2 or 1)
+                    self._log(f"Rate limit encountered, reducing concurrency to {new_concurrency}.")
+                elif failures / max(len(batch), 1) > 0.3:
+                    new_concurrency = max(min_concurrency, current_concurrency - 1)
+                    self._log(f"High error rate in batch, lowering concurrency to {new_concurrency}.")
+                elif failures == 0 and not rate_limit_hits and avg_time < 1.5 and current_concurrency < max_concurrent:
+                    new_concurrency = min(max_concurrent, current_concurrency + 1)
+                    self._log(f"Stable & fast ({avg_time:.2f}s each). Bumping concurrency to {new_concurrency}.")
+                
+                current_concurrency = new_concurrency
+            
+            idx += len(batch)
+        
+        if not self.is_downloading:
+            self._log("Download cancelled.")
+            return
         
         # Complete
         self.after(0, self.progress_section.set_complete)
+        self.after(0, lambda: self._update_console_progress(1, "All downloads complete"))
         self.after(0, self._download_complete)
         
         # Show summary
@@ -701,6 +996,7 @@ class SnapchatDownloaderApp(ctk.CTk):
         self.is_downloading = False
         self.download_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
+        self.console_file_label.configure(text="Ready for the next run")
 
 
 # ============== Entry Point ==============
